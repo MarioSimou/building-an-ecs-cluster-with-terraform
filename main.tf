@@ -448,7 +448,7 @@ resource "aws_ecs_service" "ecs_services" {
         container_port = each.value.containerPort
     }
 
-//    depends_on = [
-//        aws_lb_listener.http_listener
-//    ]
+    depends_on = [
+          aws_lb_listener.http_listener
+    ]
 }
