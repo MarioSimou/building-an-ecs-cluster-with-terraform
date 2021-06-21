@@ -1,5 +1,5 @@
 resource "aws_vpc" "vpc" {
-    cidr_block = "10.0.0.0/16"
+    cidr_block = "172.31.0.0/16"
     enable_dns_hostnames = true
     enable_dns_support = true
 
@@ -40,15 +40,15 @@ resource "aws_internet_gateway" "igw" {
 locals {
     subnets = [
         {
-            cidr_block = "10.0.1.0/24"
+            cidr_block = "172.31.16.0/20"
             az = "us-east-1a"
         },
         {
-            cidr_block = "10.0.2.0/24"
+            cidr_block = "172.31.32.0/20"
             az = "us-east-1b"
         },
         {
-            cidr_block = "10.0.3.0/24"
+            cidr_block = "172.31.0.0/20"
             az = "us-east-1c"
         }
     ]
@@ -142,11 +142,25 @@ locals {
     )
     security_groups_ids = [for sg in aws_security_group.sgs: sg.id]
     services = {
-        "web" = {}
+        web = {
+            cpu = 256
+            memory = 512
+            essential = true
+            containerPort = 8080
+            desired_count = 1
+        }
     }
     service_target_group_id_map = zipmap(
         [for serviceName, options in local.services: serviceName],
         [for tg in aws_lb_target_group.lb_tgs: tg.id]
+    )
+    service_repository_map = zipmap(
+        [for serviceName, options in local.services: serviceName ],
+        [for repo in aws_ecr_repository.ecr_repositories: repo.repository_url]
+    )
+    service_task_definition_map = zipmap(
+        [for serviceName, options in local.services: serviceName],
+        [for taskDefinition in aws_ecs_task_definition.taskDefinitions: taskDefinition.arn]
     )
 }
 
@@ -157,7 +171,7 @@ resource "aws_subnet" "subnets" {
     cidr_block = element(local.subnets, count.index).cidr_block
     availability_zone = element(local.subnets, count.index).az
     tags = {
-        Name = format("%s-subnet", var.org)
+        Name = format("%s-subnet-%s", var.org, count.index)
     }
 }
 
@@ -260,4 +274,101 @@ resource "aws_ecr_repository" "ecr_repositories" {
     tags = {
         Name = format("%s-%s", var.org, each.key)
     }    
+}
+
+data "aws_iam_policy_document" "bot_role_inline_policy" {
+    version = "2012-10-17"
+    statement {
+        actions = [
+            "ecs:*",
+        ]
+        effect = "Allow"
+        resources = ["*"]
+    }
+    statement {
+        actions  = [
+            "ecr:*"
+        ]
+        effect = "Allow"
+        resources = ["*"]
+    }
+}
+
+data "aws_iam_policy_document" "bot_role_assume_policy" {
+    version = "2012-10-17"
+    statement {
+        actions = [
+            "sts:AssumeRole"
+        ]
+        effect = "Allow"
+        principals {
+            type = "Service"
+            identifiers = [
+                "ecs.amazonaws.com",
+               "ecs-tasks.amazonaws.com",
+            ]
+        }
+    }
+}
+
+resource "aws_iam_role" "bot_role" {
+    name = format("%s-bot-role", var.org)
+    assume_role_policy = data.aws_iam_policy_document.bot_role_assume_policy.json
+
+    inline_policy { 
+        name = format("%s-bot-role-inline-policy", var.org)
+        policy = data.aws_iam_policy_document.bot_role_inline_policy.json
+    }
+
+    tags = {
+        Name = format("%s-bot-role", var.org)
+    }
+}
+
+resource "aws_ecs_task_definition" "taskDefinitions" {
+    for_each = local.services
+    family = format("%s-task-definition", each.key)
+    cpu = each.value.cpu
+    memory = each.value.memory
+    network_mode = "awsvpc"
+    requires_compatibilities = ["FARGATE"]
+    task_role_arn = aws_iam_role.bot_role.arn
+    execution_role_arn = aws_iam_role.bot_role.arn
+    
+    container_definitions = jsonencode([
+        {
+            name = each.key
+            image = lookup(local.service_repository_map, each.key)
+            cpu = each.value.cpu
+            memory = each.value.memory
+            essential = each.value.essential
+            portMappings = [
+                {
+                    containerPort = each.value.containerPort
+                    hostPort = each.value.containerPort
+                }
+            ] 
+        }
+    ])
+}
+
+resource "aws_ecs_service" "ecs_services" {
+    for_each = local.services
+    name = format("%s-service", each.key)
+    cluster = aws_ecs_cluster.cluster.id
+    task_definition = lookup(local.service_task_definition_map, each.key)
+    desired_count = each.value.desired_count
+    launch_type = "FARGATE"
+
+    network_configuration {
+        subnets = local.subnets_ids
+        security_groups = [ lookup(local.security_group_name_id_map, each.key) ]
+        assign_public_ip = true
+    }
+    
+    load_balancer {
+        target_group_arn = lookup(local.service_target_group_id_map, each.key)
+        container_name = each.key
+        container_port = each.value.containerPort
+    }
 }

@@ -37,3 +37,8 @@ output "lb_dns_name" {
     description = "load balancer DNS name"
     value = aws_lb.lb.dns_name
 }
+
+output "repositories_urls" {
+    description = "urls of the repositories"
+    value = [for repo in aws_ecr_repository.ecr_repositories: repo.repository_url]
+}
