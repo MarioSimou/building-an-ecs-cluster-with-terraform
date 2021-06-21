@@ -27,6 +27,10 @@ resource "aws_default_network_acl" "network_acl" {
     tags = {
         Name = format("%s-network-acl", var.org)
     }
+
+    lifecycle {
+        ignore_changes = [egress, ingress, subnet_ids]
+    }
 }
 
 resource "aws_internet_gateway" "igw" {
@@ -127,6 +131,49 @@ locals {
                     to_port = 8080
                     protocol = "tcp"
                     cidr_blocks = ["0.0.0.0/0"]
+                },
+                {
+                    type = "egress"
+                    from_port = 0
+                    to_port = 0
+                    protocol = "all"
+                    cidr_blocks = ["0.0.0.0/0"]
+                }
+            ]
+        }
+        hello = {
+            rules = [
+                {
+                    type = "ingress"
+                    from_port = 8080
+                    to_port = 8080
+                    protocol = "tcp"
+                    cidr_blocks = ["0.0.0.0/0"]
+                },
+                {
+                    type = "egress"
+                    from_port = 0
+                    to_port = 0
+                    protocol = "all"
+                    cidr_blocks = ["0.0.0.0/0"]
+                }
+            ]
+        }
+        lb = {
+            rules = [
+                {
+                    type = "ingress"
+                    from_port = 80
+                    to_port = 80
+                    protocol = "tcp"
+                    cidr_blocks = ["0.0.0.0/0"]
+                },
+                {
+                    type = "egress"
+                    from_port = 0
+                    to_port = 0
+                    protocol = "all"
+                    cidr_blocks = ["0.0.0.0/0"]
                 }
             ]
         }
@@ -148,6 +195,17 @@ locals {
             essential = true
             containerPort = 8080
             desired_count = 1
+            health_path = "/ping"
+            listener_priority = 20
+        }
+        hello = {
+            cpu = 256
+            memory = 512
+            essential = true
+            containerPort = 8080
+            desired_count = 1
+            health_path = "/ping"
+            listener_priority = 10
         }
     }
     service_target_group_id_map = zipmap(
@@ -227,7 +285,7 @@ resource "aws_lb" "lb" {
     internal = false
     load_balancer_type = "application"
     subnets = local.subnets_ids
-    security_groups = local.security_groups_ids
+    security_groups = [ lookup(local.security_group_name_id_map, "lb") ]
 }
 
 resource "aws_lb_listener" "http_listener" {
@@ -241,6 +299,24 @@ resource "aws_lb_listener" "http_listener" {
     }
 }
 
+resource "aws_lb_listener_rule" "listener_rules" {
+    for_each = local.services
+    listener_arn = aws_lb_listener.http_listener.arn
+    priority = each.value.listener_priority
+
+    action {
+        type = "forward"
+        target_group_arn = lookup(local.service_target_group_id_map, each.key)
+    }
+
+    condition {
+        http_header {
+            http_header_name = "X-Service"
+            values = [ each.key ]
+        }
+    }
+}
+
 resource "aws_lb_target_group" "lb_tgs" {
     for_each = local.services
 
@@ -249,6 +325,11 @@ resource "aws_lb_target_group" "lb_tgs" {
     protocol = "HTTP"
     target_type = "ip"
     vpc_id = aws_vpc.vpc.id
+
+    health_check {
+        enabled = true
+        path = each.value.health_path
+    }
 }
 
 resource "aws_ecs_cluster" "cluster" {
@@ -281,12 +362,6 @@ data "aws_iam_policy_document" "bot_role_inline_policy" {
     statement {
         actions = [
             "ecs:*",
-        ]
-        effect = "Allow"
-        resources = ["*"]
-    }
-    statement {
-        actions  = [
             "ecr:*"
         ]
         effect = "Allow"
@@ -359,6 +434,7 @@ resource "aws_ecs_service" "ecs_services" {
     task_definition = lookup(local.service_task_definition_map, each.key)
     desired_count = each.value.desired_count
     launch_type = "FARGATE"
+    wait_for_steady_state = false
 
     network_configuration {
         subnets = local.subnets_ids
@@ -371,4 +447,8 @@ resource "aws_ecs_service" "ecs_services" {
         container_name = each.key
         container_port = each.value.containerPort
     }
+
+//    depends_on = [
+//        aws_lb_listener.http_listener
+//    ]
 }
