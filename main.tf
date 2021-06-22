@@ -1,46 +1,3 @@
-resource "aws_vpc" "vpc" {
-    cidr_block = "172.31.0.0/16"
-    enable_dns_hostnames = true
-    enable_dns_support = true
-
-    tags = {
-        Name = format("%s-vpc", var.org)
-    }
-}
-
-resource "aws_main_route_table_association" "vpc_rt_association" {
-    vpc_id = aws_vpc.vpc.id
-    route_table_id = aws_vpc.vpc.default_route_table_id
-}
-
-resource "aws_default_route_table" "rt" {
-    default_route_table_id = aws_vpc.vpc.default_route_table_id
-
-    tags = {
-        Name = format("%s-rt", var.org)
-    }
-}
-
-resource "aws_default_network_acl" "network_acl" {
-    default_network_acl_id = aws_vpc.vpc.default_network_acl_id
-
-    tags = {
-        Name = format("%s-network-acl", var.org)
-    }
-
-    lifecycle {
-        ignore_changes = [egress, ingress, subnet_ids]
-    }
-}
-
-resource "aws_internet_gateway" "igw" {
-    vpc_id = aws_vpc.vpc.id
-
-    tags = {
-        Name = format("%s-igw", var.org)
-    }
-}
-
 locals {
     subnets = [
         {
@@ -195,6 +152,7 @@ locals {
             essential = true
             containerPort = 8080
             desired_count = 1
+            max_count = 3
             health_path = "/ping"
             listener_priority = 20
         }
@@ -204,6 +162,7 @@ locals {
             essential = true
             containerPort = 8080
             desired_count = 1
+            max_count = 3
             health_path = "/ping"
             listener_priority = 10
         }
@@ -220,6 +179,64 @@ locals {
         [for serviceName, options in local.services: serviceName],
         [for taskDefinition in aws_ecs_task_definition.taskDefinitions: taskDefinition.arn]
     )
+    service_appautoscaling_target_map = zipmap(
+        [for serviceName, options in local.services: serviceName],
+        [for ast in aws_appautoscaling_target.ecs_services_autoscaling_groups: ast ]
+    )
+}
+
+resource "aws_vpc" "vpc" {
+    cidr_block = "172.31.0.0/16"
+    enable_dns_hostnames = true
+    enable_dns_support = true
+
+    tags = {
+        Name = format("%s-vpc", var.org)
+    }
+}
+
+resource "aws_main_route_table_association" "vpc_rt_association" {
+    vpc_id = aws_vpc.vpc.id
+    route_table_id = aws_vpc.vpc.default_route_table_id
+}
+
+resource "aws_default_route_table" "rt" {
+    default_route_table_id = aws_vpc.vpc.default_route_table_id
+
+    tags = {
+        Name = format("%s-rt", var.org)
+    }
+}
+
+resource "aws_default_network_acl" "network_acl" {
+    default_network_acl_id = aws_vpc.vpc.default_network_acl_id
+
+    tags = {
+        Name = format("%s-network-acl", var.org)
+    }
+
+    lifecycle {
+        ignore_changes = [egress, ingress, subnet_ids]
+    }
+}
+
+resource "aws_internet_gateway" "igw" {
+    vpc_id = aws_vpc.vpc.id
+
+    tags = {
+        Name = format("%s-igw", var.org)
+    }
+}
+
+resource "aws_flow_log" "flow_log" {
+    iam_role_arn = aws_iam_role.bot_role.arn
+    log_destination = aws_cloudwatch_log_group.log_group.arn
+    traffic_type = "ALL"
+    vpc_id = aws_vpc.vpc.id
+}
+
+resource "aws_cloudwatch_log_group" "log_group" {
+    name = format("%s-log-group", var.org)
 }
 
 resource "aws_subnet" "subnets" {
@@ -338,7 +355,7 @@ resource "aws_ecs_cluster" "cluster" {
 
     setting {
         name = "containerInsights"
-        value = "disabled"
+        value = "enabled"
     }
 
     default_capacity_provider_strategy {
@@ -350,7 +367,7 @@ resource "aws_ecr_repository" "ecr_repositories" {
     for_each = local.services
 
     name = format("%s-%s", var.org, each.key)
-    image_tag_mutability = "IMMUTABLE"
+    image_tag_mutability = "MUTABLE"
 
     tags = {
         Name = format("%s-%s", var.org, each.key)
@@ -389,6 +406,7 @@ data "aws_iam_policy_document" "bot_role_assume_policy" {
 resource "aws_iam_role" "bot_role" {
     name = format("%s-bot-role", var.org)
     assume_role_policy = data.aws_iam_policy_document.bot_role_assume_policy.json
+    force_detach_policies = true
 
     inline_policy { 
         name = format("%s-bot-role-inline-policy", var.org)
@@ -433,6 +451,9 @@ resource "aws_ecs_service" "ecs_services" {
     cluster = aws_ecs_cluster.cluster.id
     task_definition = lookup(local.service_task_definition_map, each.key)
     desired_count = each.value.desired_count
+    deployment_maximum_percent = 200
+    deployment_minimum_healthy_percent = 50
+    health_check_grace_period_seconds = 60
     launch_type = "FARGATE"
     wait_for_steady_state = false
 
@@ -448,7 +469,42 @@ resource "aws_ecs_service" "ecs_services" {
         container_port = each.value.containerPort
     }
 
+    lifecycle {
+       ignore_changes = [
+            task_definition
+       ]
+    }
+
     depends_on = [
           aws_lb_listener.http_listener
     ]
+}
+
+resource "aws_appautoscaling_target" "ecs_services_autoscaling_groups" {
+    for_each = local.services
+
+    max_capacity = each.value.max_count
+    min_capacity = each.value.desired_count
+    resource_id = format("service/%s/%s", aws_ecs_cluster.cluster.name, format("%s-service", each.key) )
+    scalable_dimension = "ecs:service:DesiredCount"
+    service_namespace = "ecs"
+}
+
+resource "aws_appautoscaling_policy" "ecs_services_autoscaling_policies" {
+    for_each = local.services
+    policy_type = "TargetTrackingScaling"
+    name = format("%s-%s-memory-asg", var.org, each.key)
+    resource_id = lookup(local.service_appautoscaling_target_map, each.key).resource_id
+    scalable_dimension = lookup(local.service_appautoscaling_target_map, each.key).scalable_dimension
+    service_namespace = lookup(local.service_appautoscaling_target_map, each.key).service_namespace
+
+    target_tracking_scaling_policy_configuration {
+        predefined_metric_specification {
+          predefined_metric_type = "ECSServiceAverageMemoryUtilization"
+        }  
+          
+        target_value = 75
+        scale_in_cooldown = 300
+        scale_out_cooldown = 300
+    }
 }
